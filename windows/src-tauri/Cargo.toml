@@ -1,6 +1,6 @@
 [package]
 name = "devpilot-windows"
-version = "0.1.0"
+version = "0.1.10"
 description = "DevPilot port monitor for Windows"
 authors = ["DevPilot contributors"]
 edition = "2021"
