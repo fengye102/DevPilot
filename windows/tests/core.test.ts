@@ -6,7 +6,7 @@ import {
   groupPorts,
   serverLabel,
   shortPath,
-  uniquePids,
+  terminateTargets,
   type PortUsage,
 } from "../src/core";
 
@@ -24,6 +24,7 @@ const ports: PortUsage[] = [
     executablePath: "C:\\Users\\rose\\AppData\\Local\\Temp\\go-build\\main.exe",
     workingDirectory: "C:\\Users\\rose\\code\\api",
     isProjectService: true,
+    processStartTime: 1000,
   },
   {
     id: "TCP-3000-43-127.0.0.1",
@@ -38,6 +39,7 @@ const ports: PortUsage[] = [
     executablePath: "C:\\Program Files\\nodejs\\node.exe",
     workingDirectory: "C:\\Users\\rose\\code\\web",
     isProjectService: true,
+    processStartTime: 2000,
   },
   {
     id: "UDP-5353-100-0.0.0.0",
@@ -52,6 +54,7 @@ const ports: PortUsage[] = [
     executablePath: "C:\\Windows\\System32\\svchost.exe",
     workingDirectory: "C:\\Windows\\System32",
     isProjectService: false,
+    processStartTime: 3000,
   },
 ];
 
@@ -67,12 +70,21 @@ describe("port view model", () => {
     const groups = groupPorts(ports);
     expect(groups[0].port).toBe(3000);
     expect(groups[0].usages).toHaveLength(2);
-    expect(uniquePids([ports[0], ports[0], ports[1]])).toEqual([42, 43]);
+  });
+
+  it("builds terminate targets with pid and start time, deduplicated", () => {
+    expect(terminateTargets([ports[0], ports[0], ports[1]])).toEqual([
+      { pid: 42, processStartTime: 1000 },
+      { pid: 43, processStartTime: 2000 },
+    ]);
+    expect(terminateTargets([{ ...ports[0], pid: 0 }])).toEqual([]);
   });
 
   it("traces parent processes but ignores shells", () => {
     expect(displayCommand(ports[0])).toBe("go");
     expect(displayCommand(ports[1])).toBe("node");
+
+    expect(displayCommand({ ...ports[0], parentCommand: "PowerShell.EXE" })).toBe("main");
   });
 
   it("formats Windows paths and wildcard listeners", () => {
@@ -84,5 +96,9 @@ describe("port view model", () => {
     expect(compareVersions("1.10.0", "1.9.9")).toBe(1);
     expect(compareVersions("v2.0.0", "2.0.0")).toBe(0);
     expect(compareVersions("0.9.0", "1.0.0")).toBe(-1);
+    expect(compareVersions("1.0", "1.0.0")).toBe(0);
+    expect(compareVersions("1.0.0-beta.1", "1.0.0")).toBe(-1);
+    expect(compareVersions("1.0.0", "1.0.0-beta.1")).toBe(1);
+    expect(compareVersions("2.0.1-beta.1", "2.0.0")).toBe(1);
   });
 });
