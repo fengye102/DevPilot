@@ -1,6 +1,6 @@
 # DevPilot for Windows
 
-基于 Tauri 2 的 Windows 桌面端，与 `macos/` 版本保持相同的端口监控工作流：
+基于 Tauri 2 的 Windows 桌面端，提供完整的 Windows 端口监控工作流：
 
 - 系统托盘点击后速览最多 8 个项目服务；
 - 项目服务 / 全部端口、TCP / UDP 分段筛选；
@@ -48,11 +48,6 @@ npm run build
 
 产物位于 `src-tauri/target/release/bundle/`，配置同时生成 NSIS `.exe` 与 WiX `.msi` 安装包。默认使用当前用户安装模式，不要求管理员权限。
 
-在非 Windows 宿主上只检查 Windows 条件编译分支（不生成资源或安装包）可使用：
-
-```bash
-DEVPILOT_CROSS_CHECK=1 cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
-```
 
 本机也可对已启动的测试监听器运行同一后端冒烟测试：
 
@@ -64,4 +59,4 @@ cargo run --release --manifest-path src-tauri/Cargo.toml --bin devpilot-self-tes
 
 普通权限可以完整管理当前用户启动的开发服务。Windows 对部分系统进程和其他用户进程会隐藏工作目录或拒绝终止；需要查看/关闭这些受保护端口时，可选择“以管理员身份运行”。应用不会主动请求提权。
 
-项目服务的 Windows 分类规则与 macOS 版语义一致：仅包含本地地址上的 TCP `LISTEN`、属于当前用户、且工作目录或可执行文件不位于 Windows/Program Files/ProgramData/AppData 系统应用区域的进程。Node 等安装在 Program Files 中、但工作目录位于项目路径的开发服务仍会正确显示。
+项目服务的 Windows 分类规则：仅包含本地地址上的 TCP `LISTEN`、属于当前用户、且工作目录或可执行文件不位于 Windows/Program Files/ProgramData/AppData 系统应用区域的进程。Node 等安装在 Program Files 中、但工作目录位于项目路径的开发服务仍会正确显示。
