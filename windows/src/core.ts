@@ -14,6 +14,12 @@ export interface PortUsage {
   workingDirectory: string;
   parentCommand: string;
   isProjectService: boolean;
+  processStartTime: number;
+}
+
+export interface TerminateTarget {
+  pid: number;
+  processStartTime: number;
 }
 
 export interface PortFilters {
@@ -27,15 +33,7 @@ export interface PortGroup {
   usages: PortUsage[];
 }
 
-const SHELLS = new Set([
-  "bash",
-  "zsh",
-  "fish",
-  "sh",
-  "dash",
-  "tcsh",
-  "ksh",
-  "csh",
+const WINDOWS_SHELLS = new Set([
   "cmd",
   "cmd.exe",
   "powershell",
@@ -47,11 +45,13 @@ const SHELLS = new Set([
 export function displayCommand(port: PortUsage): string {
   const parent = (port.parentCommand || "").trim();
   const command = (port.command || "").trim();
+  const normalizedParent = parent.toLowerCase();
+  const normalizedCommand = command.toLowerCase();
   if (
     port.isProjectService &&
     parent &&
-    parent.toLowerCase() !== command.toLowerCase() &&
-    !SHELLS.has(parent.toLowerCase())
+    normalizedParent !== normalizedCommand &&
+    !WINDOWS_SHELLS.has(normalizedParent)
   ) {
     return parent;
   }
@@ -71,8 +71,8 @@ export function serverLabel(port: PortUsage): string {
   return `${host}:${port.port}`;
 }
 
-export function filterPorts(ports: PortUsage[], filters: PortFilters): PortUsage[] {
-  const search = filters.query.trim().toLocaleLowerCase();
+export function filterPorts(ports: readonly PortUsage[], filters: PortFilters): PortUsage[] {
+  const search = filters.query.trim().toLowerCase();
   return ports.filter((port) => {
     if (filters.scope === "project" && !port.isProjectService) return false;
     if (filters.protocol !== "all" && port.protocolName !== filters.protocol) return false;
@@ -85,43 +85,59 @@ export function filterPorts(ports: PortUsage[], filters: PortFilters): PortUsage
       port.workingDirectory,
       String(port.port),
       String(port.pid),
-    ].some((value) => (value || "").toLocaleLowerCase().includes(search));
+    ].some((value) => (value || "").toLowerCase().includes(search));
   });
 }
 
-export function groupPorts(ports: PortUsage[]): PortGroup[] {
+export function groupPorts(ports: readonly PortUsage[]): PortGroup[] {
   const byPort = new Map<number, PortUsage[]>();
   for (const port of ports) {
-    const group = byPort.get(port.port) || [];
-    group.push(port);
-    byPort.set(port.port, group);
+    const group = byPort.get(port.port);
+    if (group) {
+      group.push(port);
+    } else {
+      byPort.set(port.port, [port]);
+    }
   }
   return [...byPort.entries()]
     .sort(([left], [right]) => left - right)
     .map(([port, usages]) => ({ port, usages }));
 }
 
-export function uniqueValues<T>(values: T[]): T[] {
-  return [...new Set(values.filter((value) => value !== undefined && value !== null))];
+export function uniqueValues<T>(values: readonly T[]): T[] {
+  return [...new Set(values)];
 }
 
-export function uniquePids(usages: PortUsage[]): number[] {
-  return uniqueValues(usages.map((usage) => usage.pid).filter((pid) => pid > 0)).sort(
-    (left, right) => left - right,
-  );
+// 终止目标：按 PID 去重并携带进程启动时间，供后端校验 PID 未被复用。
+export function terminateTargets(usages: readonly PortUsage[]): TerminateTarget[] {
+  const byPid = new Map<number, number>();
+  for (const usage of usages) {
+    if (usage.pid > 0 && !byPid.has(usage.pid)) {
+      byPid.set(usage.pid, usage.processStartTime);
+    }
+  }
+  return [...byPid.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([pid, processStartTime]) => ({ pid, processStartTime }));
 }
 
 export function compareVersions(left: string, right: string): -1 | 0 | 1 {
-  const parse = (version: string): number[] =>
-    version
-      .replace(/^[vV]/, "")
+  const parse = (version: string): { parts: number[]; prerelease: boolean } => {
+    const normalized = version.replace(/^[vV]/, "");
+    const dashIndex = normalized.indexOf("-");
+    const core = dashIndex === -1 ? normalized : normalized.slice(0, dashIndex);
+    const parts = core
       .split(".")
       .map((part) => Number.parseInt(part.match(/^\d+/)?.[0] || "0", 10));
+    return { parts, prerelease: dashIndex !== -1 };
+  };
   const a = parse(left);
   const b = parse(right);
-  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
-    const delta = (a[index] || 0) - (b[index] || 0);
+  for (let index = 0; index < Math.max(a.parts.length, b.parts.length); index += 1) {
+    const delta = (a.parts[index] || 0) - (b.parts[index] || 0);
     if (delta !== 0) return delta > 0 ? 1 : -1;
   }
+  // 主版本号相同：预发布版本低于正式版本。
+  if (a.prerelease !== b.prerelease) return a.prerelease ? -1 : 1;
   return 0;
 }
