@@ -1,7 +1,7 @@
 mod model;
 mod scanner;
 
-use model::{AppInfo, PortScanResult, TerminateResult, UpdateStatus};
+use model::{AppInfo, PortScanResult, TerminateResult, TerminateTarget, UpdateStatus};
 use serde::Deserialize;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -80,6 +80,13 @@ pub fn run_backend_smoke_test(port: u16, terminate: bool) -> Result<(), String> 
         return Err(format!("测试端口 {port} 未解析到父进程"));
     }
 
+    let targets = project_usages
+        .iter()
+        .map(|usage| TerminateTarget {
+            pid: usage.pid,
+            process_start_time: usage.process_start_time,
+        })
+        .collect::<Vec<_>>();
     let pids = project_usages
         .iter()
         .map(|usage| usage.pid)
@@ -93,7 +100,7 @@ pub fn run_backend_smoke_test(port: u16, terminate: bool) -> Result<(), String> 
     );
 
     if terminate {
-        let terminated = scanner::terminate_processes(pids)?;
+        let terminated = scanner::terminate_processes(targets)?;
         if terminated.terminated_pids.is_empty() {
             return Err(format!("测试端口 {port} 的进程没有被关闭"));
         }
@@ -114,8 +121,8 @@ async fn scan_ports() -> Result<PortScanResult, String> {
 }
 
 #[tauri::command]
-async fn terminate_processes(pids: Vec<u32>) -> Result<TerminateResult, String> {
-    tauri::async_runtime::spawn_blocking(move || scanner::terminate_processes(pids))
+async fn terminate_processes(targets: Vec<TerminateTarget>) -> Result<TerminateResult, String> {
+    tauri::async_runtime::spawn_blocking(move || scanner::terminate_processes(targets))
         .await
         .map_err(|error| format!("关闭进程任务失败：{error}"))?
 }
@@ -141,56 +148,40 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
         return Err("项目路径为空".into());
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        let mut command = Command::new("explorer.exe");
-        if std::path::Path::new(&path).is_dir() {
-            command.arg(&path);
-        } else {
-            command.args(["/select,", &path]);
-        }
-        command
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("无法在资源管理器中打开路径：{error}"))
+    let mut command = Command::new("explorer.exe");
+    if std::path::Path::new(&path).is_dir() {
+        command.arg(&path);
+    } else {
+        command.arg("/select,").arg(&path);
     }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Command::new("open")
-            .arg(&path)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("无法打开路径：{error}"))
-    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法在资源管理器中打开路径：{error}"))
 }
 
 #[tauri::command]
 fn copy_text(text: String) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    let mut child = Command::new("powershell.exe")
+    let mut child = Command::new(powershell_path())
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+            "[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
         ])
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|error| format!("无法访问剪贴板：{error}"))?;
 
-    #[cfg(not(target_os = "windows"))]
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("无法访问剪贴板：{error}"))?;
-
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "无法写入剪贴板".to_owned())?
-        .write_all(text.as_bytes())
-        .map_err(|error| format!("无法写入剪贴板：{error}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "无法写入剪贴板".to_owned())?;
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("无法写入剪贴板：{error}"))?;
+    }
     let status = child
         .wait()
         .map_err(|error| format!("剪贴板命令失败：{error}"))?;
@@ -206,6 +197,16 @@ struct GitHubRelease {
     html_url: String,
 }
 
+/// 解析系统 PowerShell 的绝对路径，避免 PATH 解析被劫持。
+fn powershell_path() -> std::path::PathBuf {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    std::path::Path::new(&system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+}
+
 #[tauri::command]
 async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateStatus, String> {
     let current_version = app.package_info().version.to_string();
@@ -215,23 +216,13 @@ async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateStatus, String
 }
 
 fn fetch_update_status(current_version: String) -> Result<UpdateStatus, String> {
-    #[cfg(not(target_os = "windows"))]
-    const RELEASE_API: &str = "https://api.github.com/repos/pkc918/DevPilot/releases/latest";
-
-    #[cfg(target_os = "windows")]
-    let output = Command::new("powershell.exe")
+    let output = Command::new(powershell_path())
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; Invoke-RestMethod -Headers @{'User-Agent'='DevPilot-Windows'} -Uri 'https://api.github.com/repos/pkc918/DevPilot/releases/latest' | Select-Object tag_name,html_url | ConvertTo-Json -Compress",
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; Invoke-RestMethod -TimeoutSec 15 -Headers @{'User-Agent'='DevPilot-Windows'} -Uri 'https://api.github.com/repos/pkc918/DevPilot/releases/latest' | Select-Object tag_name,html_url | ConvertTo-Json -Compress",
         ])
-        .output()
-        .map_err(|error| format!("无法启动更新检查：{error}"))?;
-
-    #[cfg(not(target_os = "windows"))]
-    let output = Command::new("curl")
-        .args(["-fsSL", "-H", "User-Agent: DevPilot-Windows", RELEASE_API])
         .output()
         .map_err(|error| format!("无法启动更新检查：{error}"))?;
 
@@ -253,16 +244,22 @@ fn fetch_update_status(current_version: String) -> Result<UpdateStatus, String> 
     let latest_version = release.tag_name.trim_start_matches(['v', 'V']).to_owned();
 
     Ok(UpdateStatus {
-        has_update: version_parts(&latest_version) > version_parts(&current_version),
+        has_update: version_is_newer(&latest_version, &current_version),
         current_version,
         latest_version,
         release_url: release.html_url,
     })
 }
 
-fn version_parts(version: &str) -> Vec<u64> {
-    version
-        .trim_start_matches(['v', 'V'])
+/// 解析版本号为「主版本段 + 是否预发布」。
+/// 预发布版本低于同号正式版本（SemVer）：`2.0.0-beta.1 < 2.0.0`。
+fn version_parts(version: &str) -> (Vec<u64>, bool) {
+    let normalized = version.trim_start_matches(['v', 'V']);
+    let (core, prerelease) = match normalized.split_once('-') {
+        Some((core, _)) => (core, true),
+        None => (normalized, false),
+    };
+    let parts = core
         .split('.')
         .map(|part| {
             part.chars()
@@ -271,21 +268,38 @@ fn version_parts(version: &str) -> Vec<u64> {
                 .parse::<u64>()
                 .unwrap_or(0)
         })
-        .collect()
+        .collect();
+    (parts, prerelease)
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let (latest_parts, latest_pre) = version_parts(latest);
+    let (current_parts, current_pre) = version_parts(current);
+    let len = latest_parts.len().max(current_parts.len());
+    for index in 0..len {
+        let delta = latest_parts
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&current_parts.get(index).copied().unwrap_or(0));
+        if delta != std::cmp::Ordering::Equal {
+            return delta == std::cmp::Ordering::Greater;
+        }
+    }
+    // 主版本号相同：正式版 > 预发布版。
+    !latest_pre && current_pre
 }
 
 #[tauri::command]
 fn open_release_url(url: String) -> Result<(), String> {
-    if !url.starts_with("https://github.com/pkc918/DevPilot/") {
+    const RELEASE_PREFIX: &str = "https://github.com/pkc918/DevPilot/";
+    if !url.starts_with(RELEASE_PREFIX)
+        || url[RELEASE_PREFIX.len()..].starts_with('/')
+        || url.contains(['\r', '\n'])
+    {
         return Err("拒绝打开非 DevPilot GitHub 地址".into());
     }
-
-    #[cfg(target_os = "windows")]
     let result = Command::new("explorer.exe").arg(&url).spawn();
-    #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(&url).spawn();
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    let result = Command::new("xdg-open").arg(&url).spawn();
 
     result
         .map(|_| ())
@@ -422,8 +436,13 @@ mod tests {
 
     #[test]
     fn semantic_versions_compare_numerically() {
-        assert!(version_parts("1.10.0") > version_parts("1.9.9"));
-        assert_eq!(version_parts("v2.4.1"), vec![2, 4, 1]);
-        assert_eq!(version_parts("2.0.0-beta.1"), vec![2, 0, 0, 1]);
+        assert!(version_is_newer("1.10.0", "1.9.9"));
+        assert!(!version_is_newer("1.9.9", "1.10.0"));
+        assert!(!version_is_newer("2.0.0", "2.0.0"));
+        assert!(!version_is_newer("v2.4.1", "2.4.1"));
+        // 预发布版本低于同号正式版本。
+        assert!(!version_is_newer("2.0.0-beta.1", "2.0.0"));
+        assert!(version_is_newer("2.0.0", "2.0.0-beta.1"));
+        assert!(version_is_newer("2.0.1-beta.1", "2.0.0"));
     }
 }

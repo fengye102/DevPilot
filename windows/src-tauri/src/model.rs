@@ -15,6 +15,16 @@ pub struct PortUsage {
     pub working_directory: String,
     pub parent_command: String,
     pub is_project_service: bool,
+    /// 进程启动时间（秒级时间戳），用于终止前校验 PID 未被复用。
+    pub process_start_time: u64,
+}
+
+/// 终止目标：PID + 扫描时记录的进程启动时间。
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminateTarget {
+    pub pid: u32,
+    pub process_start_time: u64,
 }
 
 #[derive(Debug, Serialize)]

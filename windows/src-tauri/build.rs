@@ -1,5 +1,5 @@
 fn main() {
-    // Cross-checking an MSVC target from macOS has no Windows resource compiler.
+    // Cross-checking an MSVC target without a Windows resource compiler requires this opt-in path.
     // This opt-in path skips only resource/manifest generation so Rust can still
     // type-check every Windows-specific module. Normal dev and release builds do
     // not set the variable and always execute the full Tauri build pipeline.

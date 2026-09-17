@@ -1,4 +1,4 @@
-use crate::model::{PortScanResult, PortUsage, TerminateResult};
+use crate::model::{PortScanResult, PortUsage, TerminateResult, TerminateTarget};
 use netstat2::{
     iterate_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState,
 };
@@ -15,7 +15,7 @@ pub fn scan_ports() -> Result<PortScanResult, String> {
         .map_err(|error| format!("无法读取 Windows 网络端点：{error}"))?;
 
     // A full process refresh is intentional: Windows process CWD, executable, owner and
-    // parent data are all needed to reproduce the macOS project-service classification.
+    // parent data are all needed to perform the Windows project-service classification.
     let system = System::new_all();
     let users = Users::new_with_refreshed_list();
     let mut ports = Vec::new();
@@ -57,16 +57,7 @@ pub fn scan_ports() -> Result<PortScanResult, String> {
         }
     }
 
-    ports.sort_by(|left, right| {
-        left.port
-            .cmp(&right.port)
-            .then_with(|| {
-                left.command
-                    .to_lowercase()
-                    .cmp(&right.command.to_lowercase())
-            })
-            .then_with(|| left.pid.cmp(&right.pid))
-    });
+    ports.sort_by_cached_key(|port| (port.port, port.command.to_lowercase(), port.pid));
 
     Ok(PortScanResult {
         diagnostic_text: format!(
@@ -115,6 +106,7 @@ fn build_port_usage(
         .and_then(|parent_pid| system.process(parent_pid))
         .map(|parent| clean_process_name(parent.name().to_string_lossy().as_ref()))
         .unwrap_or_default();
+    let process_start_time = process.map(|process| process.start_time()).unwrap_or(0);
 
     let is_project_service = is_project_service(
         protocol_name,
@@ -139,6 +131,7 @@ fn build_port_usage(
         working_directory,
         parent_command,
         is_project_service,
+        process_start_time,
     }
 }
 
@@ -212,7 +205,9 @@ fn is_user_executable(executable_path: &str, working_directory: &str) -> bool {
     }
 
     if executable_path.is_empty() {
-        return true;
+        // 读不到可执行路径时按非项目服务处理：受保护的系统进程常常同时
+        // 缺少 owner 与 exe 路径，保守缺省可避免把系统服务误判为可关闭目标。
+        return false;
     }
 
     let executable = normalize_path(executable_path);
@@ -259,21 +254,41 @@ fn starts_with_dir(path: &str, parent: &str) -> bool {
     path == parent || path.starts_with(&format!("{parent}\\"))
 }
 
-pub fn terminate_processes(pids: Vec<u32>) -> Result<TerminateResult, String> {
+pub fn terminate_processes(targets: Vec<TerminateTarget>) -> Result<TerminateResult, String> {
     let current_pid = std::process::id();
-    let unique_pids: Vec<u32> = pids
-        .into_iter()
-        .filter(|pid| *pid > 0 && *pid != current_pid)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
+    // 以 PID 去重，保留首次出现的启动时间。
+    let mut unique: Vec<TerminateTarget> = Vec::new();
+    let mut seen = HashSet::new();
+    for target in targets {
+        if target.pid > 0 && target.pid != current_pid && seen.insert(target.pid) {
+            unique.push(target);
+        }
+    }
+
+    // 白名单：仅允许终止当前仍持有网络监听套接字的进程，防止渲染层任意指定 PID。
+    let listening = listening_pids().unwrap_or_default();
+
+    // 终止前刷新进程信息，校验 PID 未被复用（启动时间与扫描时一致）。
+    let mut system = System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
     let mut terminated = Vec::new();
     let mut errors = Vec::new();
-    for pid in unique_pids {
-        match terminate_process(pid) {
-            Ok(()) => terminated.push(pid),
-            Err(error) => errors.push(error),
+    for target in unique {
+        if !listening.contains(&target.pid) {
+            errors.push(format!("PID {} 当前没有监听端口，已跳过", target.pid));
+            continue;
+        }
+        match system.process(Pid::from_u32(target.pid)) {
+            // 进程已退出：视为已关闭，不算错误。
+            None => terminated.push(target.pid),
+            Some(process) if process.start_time() != target.process_start_time => {
+                errors.push(format!("PID {} 已被新进程复用，已跳过以免误杀", target.pid));
+            }
+            Some(_) => match terminate_process(target.pid) {
+                Ok(()) => terminated.push(target.pid),
+                Err(error) => errors.push(error),
+            },
         }
     }
     terminated.sort_unstable();
@@ -285,6 +300,21 @@ pub fn terminate_processes(pids: Vec<u32>) -> Result<TerminateResult, String> {
     } else {
         Err(errors.join("；"))
     }
+}
+
+/// 枚举当前持有 TCP/UDP 套接字的进程 PID 集合（终止白名单）。
+fn listening_pids() -> Result<HashSet<u32>, String> {
+    let address_families = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
+    let protocols = ProtocolFlags::TCP | ProtocolFlags::UDP;
+    let sockets = iterate_sockets_info(address_families, protocols)
+        .map_err(|error| format!("无法读取 Windows 网络端点：{error}"))?;
+    let mut pids = HashSet::new();
+    for socket in sockets.flatten() {
+        for pid in socket.associated_pids {
+            pids.insert(pid);
+        }
+    }
+    Ok(pids)
 }
 
 #[cfg(target_os = "windows")]
@@ -312,18 +342,6 @@ fn terminate_process(pid: u32) -> Result<(), String> {
             format!("关闭 PID {pid} 失败：{message}")
         })
     }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn terminate_process(pid: u32) -> Result<(), String> {
-    let status = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status()
-        .map_err(|error| format!("无法关闭 PID {pid}：{error}"))?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| format!("关闭 PID {pid} 失败"))
 }
 
 #[cfg(test)]
